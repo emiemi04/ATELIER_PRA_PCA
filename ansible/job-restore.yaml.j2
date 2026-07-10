@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sqlite-restore
+  namespace: {{ namespace }}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: restore
+          image: alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+{% if restore_file %}
+              TARGET="/backup/{{ restore_file }}"
+              if [ ! -f "$TARGET" ]; then
+                echo "Fichier de backup introuvable : $TARGET" >&2
+                echo "Backups disponibles :" >&2
+                ls -1 /backup/*.db 2>/dev/null >&2 || true
+                exit 1
+              fi
+{% else %}
+              TARGET=$(ls -t /backup/*.db 2>/dev/null | head -1)
+              if [ -z "$TARGET" ]; then
+                echo "Aucun backup trouvé dans /backup" >&2
+                exit 1
+              fi
+{% endif %}
+              echo "Restauration depuis : $TARGET"
+              cp "$TARGET" /data/app.db
+              echo "Restauration terminée."
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: backup
+              mountPath: /backup
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pra-data
+        - name: backup
+          persistentVolumeClaim:
+            claimName: pra-backup
