@@ -1,0 +1,79 @@
+---
+- name: PRA workshop - restauration a un point de restauration choisi
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    namespace: pra
+    restore_file: ""   # nom exact du fichier, "latest", ou vide pour lister
+
+  tasks:
+
+    - name: Verifier que le deployment flask est present
+      ansible.builtin.command: kubectl -n {{ namespace }} get deployment flask
+      register: deploy_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stopper si le deployment flask n'existe pas
+      ansible.builtin.fail:
+        msg: "Le deployment 'flask' est introuvable dans le namespace {{ namespace }}. Lancez d'abord ansible-playbook ansible/playbook.yml"
+      when: deploy_check.rc != 0
+
+    - name: Lister les fichiers de backup disponibles
+      ansible.builtin.shell: >
+        kubectl -n {{ namespace }} exec deploy/flask --
+        sh -c "ls -1t /backup/*.db 2>/dev/null | xargs -n1 basename"
+      register: backups_raw
+      changed_when: false
+
+    - name: Construire la liste des points de restauration disponibles
+      ansible.builtin.set_fact:
+        available_backups: "{{ backups_raw.stdout_lines }}"
+
+    - name: Afficher la liste et arreter si aucun point de restauration n'a ete choisi
+      when: restore_file == ""
+      block:
+        - name: Afficher les points de restauration disponibles
+          ansible.builtin.debug:
+            msg: >-
+              {{ available_backups }}
+              --> Relancez avec: ansible-playbook ansible/restore.yml -e restore_file=<nom_du_fichier>
+              (ou -e restore_file=latest pour restaurer le plus recent)
+
+        - name: Fin du playbook
+          ansible.builtin.meta: end_play
+
+    - name: Refuser un fichier qui n'existe pas dans la liste des backups
+      ansible.builtin.fail:
+        msg: "Le fichier '{{ restore_file }}' n'est pas dans la liste : {{ available_backups }}"
+      when:
+        - restore_file != "latest"
+        - restore_file not in available_backups
+
+    - name: Generer le manifest du Job de restauration
+      ansible.builtin.template:
+        src: templates/job-restore.yaml.j2
+        dest: "/tmp/job-restore-{{ namespace }}.yaml"
+      vars:
+        restore_file: "{{ '' if restore_file == 'latest' else restore_file }}"
+
+    - name: Supprimer un ancien Job de restauration s'il existe deja
+      ansible.builtin.command: kubectl -n {{ namespace }} delete job sqlite-restore --ignore-not-found=true
+      changed_when: false
+
+    - name: Appliquer le Job de restauration
+      ansible.builtin.command: kubectl apply -f /tmp/job-restore-{{ namespace }}.yaml
+
+    - name: Attendre la fin du Job de restauration
+      ansible.builtin.command: kubectl -n {{ namespace }} wait --for=condition=complete job/sqlite-restore --timeout=120s
+
+    - name: Recuperer les logs du Job
+      ansible.builtin.command: kubectl -n {{ namespace }} logs job/sqlite-restore
+      register: restore_logs
+      changed_when: false
+
+    - name: Afficher le resultat de la restauration
+      ansible.builtin.debug:
+        msg: "{{ restore_logs.stdout_lines }}"
