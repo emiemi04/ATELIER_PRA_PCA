@@ -230,28 +230,65 @@ Faites preuve de pédagogie et soyez clair dans vos explications et procedures d
 
 **Exercice 1 :**  
 Quels sont les composants dont la perte entraîne une perte de données ?  
-  
-*..Répondez à cet exercice ici..*
+
+- **Le PVC `pra-data`** : c'est là que vit la base SQLite en production. S'il est perdu (suppression, corruption, disque du node détruit), toutes les données écrites depuis la **dernière sauvegarde** sont perdues (jusqu'à 1 minute, la fréquence du CronJob).
+- **Le PVC `pra-backup`** : s'il est perdu **en même temps** que `pra-data` (par exemple parce que les deux volumes sont hébergés sur le même disque/node K3d), il n'y a alors plus aucun moyen de restaurer quoi que ce soit → perte totale et définitive.
+- **Le node/disque du Codespace lui-même** : dans ce lab, K3d utilise le provisioner `local-path`, qui stocke les volumes sur le disque local du node. Si ce node (donc le Codespace) disparaît, `pra-data` **et** `pra-backup` sont perdus simultanément.
+
+À l'inverse, la **perte du pod `flask`** (Scénario 1) n'entraîne **aucune** perte de données : le pod est stateless, ses données vivent exclusivement dans le PVC `pra-data`, monté indépendamment du cycle de vie du pod.
 
 **Exercice 2 :**  
 Expliquez nous pourquoi nous n'avons pas perdu les données lors de la supression du PVC pra-data  
-  
-*..Répondez à cet exercice ici..*
+
+Nous n'avons pas *réellement* évité toute perte : nous avons seulement limité la perte à la fenêtre écoulée depuis la dernière sauvegarde (au pire 1 minute). Ce qui nous a permis de récupérer l'essentiel des données, c'est que :
+
+1. **Le CronJob `sqlite-backup`** copie, chaque minute, le fichier `app.db` du PVC `pra-data` vers un **second volume physiquement distinct**, le PVC `pra-backup`.
+2. Quand `pra-data` est supprimé, **`pra-backup` n'est pas affecté** : c'est un volume Kubernetes séparé, avec son propre cycle de vie.
+3. La procédure de restauration recrée un `pra-data` vide (`kubectl apply -f k8s/`), puis exécute un `Job` (`pra/50-job-restore.yaml`) qui copie le fichier de sauvegarde le plus récent de `pra-backup` vers le nouveau `pra-data`.
+
+En clair : **on n'a pas protégé le volume de données lui-même, on a dupliqué son contenu ailleurs à intervalle régulier.** C'est le principe même d'une stratégie de sauvegarde/restauration (PRA), à distinguer d'une stratégie de haute disponibilité (PCA, Scénario 1) où c'est l'infrastructure qui garantit qu'aucune donnée n'est jamais perdue.
 
 **Exercice 3 :**  
 Quels sont les RTO et RPO de cette solution ?  
-  
-*..Répondez à cet exercice ici..*
+
+- **RPO (Recovery Point Objective — perte de données maximale tolérée) : ~1 minute.**  
+  C'est la fréquence du `CronJob sqlite-backup` (`schedule: "*/1 * * * *"`). Dans le pire cas, le sinistre survient juste avant l'exécution du prochain backup : on perd donc jusqu'à 1 minute d'écritures (les messages ajoutés via `/add`).
+
+- **RTO (Recovery Time Objective — temps d'indisponibilité maximal toléré) : de l'ordre de 1 à 3 minutes**, mais **entièrement manuel** dans cet atelier. Il correspond à la somme de :
+  - `kubectl apply -f k8s/` pour recréer le namespace/PVC/Deployment/Service (~10-20s) ;
+  - le redémarrage du pod Flask et son passage en `Ready` (~5-15s) ;
+  - l'exécution du Job de restauration (`kubectl apply -f pra/50-job-restore.yaml` + attente de complétion, ~5-10s) ;
+  - **le temps de décision et d'exécution humaine** des commandes (le facteur le plus significatif ici, puisque rien n'est déclenché automatiquement).
 
 **Exercice 4 :**  
 Pourquoi cette solution (cet atelier) ne peux pas être utilisé dans un vrai environnement de production ? Que manque-t-il ?   
-  
-*..Répondez à cet exercice ici..*
+
+- **Single point of failure au niveau du stockage** : `pra-data` et `pra-backup` utilisent tous deux le provisioner `local-path` de K3d, c'est-à-dire le disque local d'un seul node. Si ce node/disque disparaît, **on perd la donnée et sa sauvegarde en même temps** — ce qui va justement à l'encontre de l'objectif d'un PRA (les sauvegardes doivent être hébergées ailleurs que la production).
+- **Cluster mono-node K3d, sans haute disponibilité réelle** : un seul master, pas de multi-AZ ni de multi-région.
+- **SQLite n'est pas fait pour la production à charge réelle** : pas de réplication native, accès concurrent en écriture limité, aucun mécanisme de failover.
+- **Aucune sauvegarde externalisée (offsite)** : les backups devraient être copiés vers un stockage objet externe (S3, GCS, Azure Blob…), dans un autre compte/région, avec une politique de rétention et de versioning.
+- **Pas de vérification d'intégrité des sauvegardes** : on ne teste jamais qu'un backup est réellement restaurable (pas de "restore drill" automatisé, pas de checksum).
+- **Restauration 100% manuelle** : aucune supervision ni détection automatique du sinistre, aucun déclenchement automatique de la restauration, donc un RTO qui dépend entièrement de la rapidité (et de la disponibilité !) d'un opérateur humain.
+- **Absence de sécurité** : pas de gestion de secrets, pas de TLS, pas de RBAC ni de NetworkPolicy pour restreindre les accès entre le pod applicatif et les jobs de backup/restore.
+- **Un seul réplica applicatif** (`replicas: 1`), donc aucune redondance côté calcul au-delà du redémarrage automatique du pod par Kubernetes.
+- **Pas de monitoring/alerting** : rien ne prévient qu'un backup a échoué ou que la fenêtre de RPO est dépassée.
   
 **Exercice 5 :**  
 Proposez une archtecture plus robuste.   
-  
-*..Répondez à cet exercice ici..*
+
+Une architecture PRA/PCA plus solide combinerait :
+
+1. **Un cluster Kubernetes managé multi-node et multi-AZ** (EKS, GKE, AKS…) plutôt qu'un K3d mono-node local, pour survivre à la perte d'un node ou d'une zone de disponibilité.
+2. **Une base de données managée et répliquée** (PostgreSQL en Multi-AZ, par exemple) à la place de SQLite, avec réplication synchrone/asynchrone entre au moins deux instances.
+3. **Un stockage persistant répliqué** (volumes cloud avec réplication inter-AZ, ou solution distribuée type Longhorn/Ceph) au lieu du `local-path` provisioner, pour que la perte d'un disque ne soit plus critique.
+4. **Des sauvegardes externalisées (offsite)**, versionnées, vers un stockage objet dans un **compte ou une région distincte** (ex : S3 + réplication cross-region, avec politique de rétention et chiffrement).
+5. **Des restaurations testées automatiquement** (restore drills périodiques et automatisés, avec vérification de checksum), pour garantir que les backups sont réellement exploitables le jour J.
+6. **Une orchestration outillée** (ex : [Velero](https://velero.io/) pour la sauvegarde/restauration native Kubernetes, associé à des CronJobs applicatifs pour la base de données).
+7. **Plusieurs réplicas applicatifs** derrière le Service, avec des probes de liveness/readiness, pour absorber la perte d'un pod sans interruption perceptible.
+8. **Monitoring et alerting** (Prometheus/Grafana + alertes) sur l'échec des sauvegardes, l'âge du dernier backup (justement exposé par notre nouvelle route `/status` !) et la santé du cluster.
+9. **Une automatisation complète de la bascule** (scripts/Ansible/Operator déclenchés automatiquement sur détection de sinistre) pour réduire le RTO, au lieu d'une procédure manuelle comme dans cet atelier.
+
+Cette architecture rapprocherait le système d'un vrai objectif de continuité (PCA) plutôt que d'une simple stratégie de sauvegarde/restauration locale (PRA), tout en réduisant fortement le RTO et le RPO.
 
 ---------------------------------------------------
 Séquence 6 : Ateliers  
