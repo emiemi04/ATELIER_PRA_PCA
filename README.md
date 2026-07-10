@@ -306,7 +306,74 @@ Difficulté : Moyenne (~2 heures)
 ### **Atelier 2 : Choisir notre point de restauration**  
 Aujourd’hui nous restaurobs “le dernier backup”. Nous souhaitons **ajouter la capacité de choisir un point de restauration**.
 
-*..Décrir ici votre procédure de restauration (votre runbook)..*  
+**Implémentation :**
+
+Le Job de restauration statique `pra/50-job-restore.yaml` (qui ne restaure que le dernier backup) a été **complété**, sans être supprimé, par :
+
+- **`ansible/templates/job-restore.yaml.j2`** : un template Jinja2 du Job de restauration. Si une variable `restore_file` est fournie, le Job copie précisément `/backup/{{ restore_file }}` (et échoue proprement avec la liste des backups disponibles si le fichier n'existe pas) ; sinon il retombe sur le comportement historique (`ls -t /backup/*.db | head -1`, le plus récent).
+- **`ansible/restore.yml`** : un playbook dédié qui :
+  1. vérifie que le deployment `flask` existe ;
+  2. **liste les points de restauration disponibles** en exécutant `ls` dans le pod `flask` (qui monte désormais `pra-backup` en lecture seule — cf. Atelier 1) ;
+  3. si aucun `restore_file` n'est fourni : **affiche la liste et s'arrête**, sans rien modifier ;
+  4. si un `restore_file` est fourni et valide : génère le Job à partir du template, le déploie, attend sa complétion, puis affiche ses logs.
+
+**Runbook — Procédure de restauration à un point choisi**
+
+1. **Constater l'incident** (application inaccessible, données incohérentes, alerte monitoring…).
+
+2. **Geler l'état actuel** pour éviter d'écraser des preuves ou d'aggraver la situation :
+   ```bash
+   kubectl -n pra scale deployment flask --replicas=0
+   kubectl -n pra patch cronjob sqlite-backup -p '{"spec":{"suspend":true}}'
+   ```
+
+3. **Lister les points de restauration disponibles** :
+   ```bash
+   ansible-playbook ansible/restore.yml
+   ```
+   Le playbook affiche la liste des fichiers de backup, triés du plus récent au plus ancien (ex : `app-1720003600.db`, `app-1720003540.db`, …). Le nom du fichier encode un timestamp Unix : `date -d @1720003600` permet de le convertir en date lisible pour choisir le bon point.
+
+4. **(Si nécessaire) Recréer l'infrastructure** avec un `pra-data` sain :
+   ```bash
+   kubectl apply -f k8s/
+   ```
+
+5. **Restaurer le point choisi** :
+   ```bash
+   ansible-playbook ansible/restore.yml -e restore_file=app-1720003600.db
+   ```
+   Ou, pour restaurer explicitement le plus récent :
+   ```bash
+   ansible-playbook ansible/restore.yml -e restore_file=latest
+   ```
+
+6. **Vérifier la restauration** :
+   ```bash
+   kubectl -n pra scale deployment flask --replicas=1
+   kubectl -n pra rollout status deployment/flask
+   kubectl -n pra port-forward svc/flask 8080:80 >/tmp/web.log 2>&1 &
+   curl -s http://localhost:8080/status | python3 -m json.tool
+   curl -s http://localhost:8080/consultation | python3 -m json.tool
+   ```
+   Contrôler que `count` et le contenu de `/consultation` correspondent bien au point de restauration choisi.
+
+7. **Reprendre les sauvegardes automatiques** une fois l'incident clos :
+   ```bash
+   kubectl -n pra patch cronjob sqlite-backup -p '{"spec":{"suspend":false}}'
+   ```
+
+8. **Documenter l'incident** (cause, point de restauration utilisé, données perdues le cas échéant entre le point choisi et l'incident) pour capitaliser sur le retour d'expérience.
+    
+---------------------------------------------------
+Evaluation
+---------------------------------------------------
+Cet atelier PRA PCA, **noté sur 20 points**, est évalué sur la base du barème suivant :  
+- Série d'exerices (5 points)
+- Atelier N°1 - Ajout d'un fonctionnalité (4 points)
+- Atelier N°2 - Choisir son point de restauration (4 points)
+- Qualité du Readme (lisibilité, erreur, ...) (3 points)
+- Processus travail (quantité de commits, cohérence globale, interventions externes, ...) (4 points) 
+
   
 ---------------------------------------------------
 Evaluation
